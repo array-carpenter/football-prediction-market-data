@@ -4,5 +4,6 @@ __pycache__/
 data/**/*.parquet
 data/**/*.json
 data/**/*.csv
+data/*.log
 *.duckdb
 .DS_Store

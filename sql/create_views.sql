@@ -10,6 +10,12 @@ SELECT * FROM read_parquet('data/curated/source_teams.parquet');
 CREATE OR REPLACE VIEW markets AS
 SELECT * FROM read_parquet('data/curated/markets.parquet');
 
+CREATE OR REPLACE VIEW dataset_manifest AS
+SELECT * FROM read_parquet('data/curated/dataset_manifest.parquet');
+
+CREATE OR REPLACE VIEW source_manifest AS
+SELECT * FROM read_parquet('data/curated/source_manifest.parquet');
+
 CREATE OR REPLACE VIEW trades AS
 SELECT * FROM read_parquet(
   'data/curated/trades/**/*.parquet',

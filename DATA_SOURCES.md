@@ -10,9 +10,9 @@ order-book states cannot be reconstructed when no collector recorded them.
 
 ## Polymarket
 
-The source database is `polymarket_nfl.sqlite`. It contains NFL event metadata,
-outcome-token mappings, public trades, changed market snapshots, and changed
-full order books.
+The source databases are `polymarket_nfl.sqlite` and
+`polymarket_cfb.sqlite`. They contain event metadata, outcome-token mappings,
+public trades, changed market snapshots, and changed full order books.
 
 The public trade API has a deep-pagination limit. Some older, high-volume event
 tails require an on-chain event-log backfill. The live collector prevents new

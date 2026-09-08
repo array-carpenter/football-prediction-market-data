@@ -20,6 +20,7 @@ Teams absent from ESPN use this format:
 
 ```text
 kalshi:{league}:{kalshi_team_uuid}
+polymarket:{league}:{polymarket_team_id}
 ```
 
 Source identifiers remain available. Do not replace them with display names.
@@ -57,7 +58,9 @@ name and abbreviation. It also records the match method and score.
 
 ## `markets.parquet`
 
-One row exists for each tradeable outcome token or Kalshi market contract.
+One row exists for each tradeable outcome token or Kalshi market contract in a
+source league. A Polymarket contract with both league tags has one row for each
+tag. Use `(venue, league, coalesce(asset_id, market_id))` as the unique key.
 
 Important columns are:
 
@@ -108,3 +111,11 @@ Fields that a venue does not supply remain null. A null does not mean zero.
 Every `moneyline`, `spread`, and `total` game market must have both
 `away_team_id` and `home_team_id`. The build writes unresolved records to
 `data/audit/` and the quality tests reject them.
+
+## Manifests
+
+`dataset_manifest.parquet` records each output file, partition, row count, file
+size, schema version, and build time.
+
+`source_manifest.parquet` records each SQLite source table, row count, source
+file size, modification time, schema version, and build time.

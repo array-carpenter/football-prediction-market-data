@@ -8,6 +8,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -23,6 +24,7 @@ ESPN = {
     "cfb": "https://site.api.espn.com/apis/site/v2/sports/football/college-football/teams?limit=1000",
     "nfl": "https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams?limit=100",
 }
+SCHEMA_VERSION = "1.1.0"
 
 
 def download(url: str, path: Path) -> None:
@@ -30,7 +32,7 @@ def download(url: str, path: Path) -> None:
     subprocess.run(["curl","-fsS",url,"-o",str(path)],check=True)
 
 
-def source_team_tables(kalshi: sqlite3.Connection, pm: sqlite3.Connection,
+def source_team_tables(kalshi: sqlite3.Connection, pm_sources: list[tuple[str,sqlite3.Connection]],
                        resolver: TeamResolver) -> tuple[pd.DataFrame, dict, dict]:
     rows = []
     kalshi_map = {}
@@ -54,17 +56,27 @@ def source_team_tables(kalshi: sqlite3.Connection, pm: sqlite3.Connection,
                      "source_name":name,"source_abbreviation":suffix,"team_id":match.team_id,
                      "match_method":match.method,"match_score":match.score})
     pm_map = {}
-    for event_id, raw in pm.execute("SELECT id,raw_json FROM events"):
+    kalshi_name_lookup={(row["league"],normalize_name(row["source_name"])):row["team_id"]
+                         for row in rows if row["venue"]=="kalshi"}
+    for source_league,pm in pm_sources:
+      for event_id, raw in pm.execute("SELECT id,raw_json FROM events"):
         obj=json.loads(raw)
         for team in obj.get("teams") or []:
-            league=str(team.get("league") or "nfl").lower()
+            league=str(team.get("league") or source_league).lower()
             if league not in ("nfl","cfb"):
                 continue
             source_id=str(team["id"])
-            match=resolver.resolve(team.get("name") or team.get("alias"),league,team.get("abbreviation"))
+            source_name=team.get("alias") or team.get("name")
+            match=resolver.resolve(source_name,league,team.get("abbreviation"))
+            if not match.team_id:
+                shared=kalshi_name_lookup.get((league,normalize_name(source_name)))
+                if shared:
+                    match=type(match)(shared,"kalshi_name_crosswalk",1.0)
+                else:
+                    match=type(match)(f"polymarket:{league}:{source_id}","polymarket_id_fallback",None)
             pm_map[(league,source_id)]=match.team_id
             rows.append({"venue":"polymarket","league":league,"source_team_id":source_id,
-                         "source_name":team.get("name"),"source_abbreviation":team.get("abbreviation"),
+                         "source_name":source_name,"source_abbreviation":team.get("abbreviation"),
                          "team_id":match.team_id,"match_method":match.method,"match_score":match.score})
     return pd.DataFrame(rows).drop_duplicates(),kalshi_map,pm_map
 
@@ -94,7 +106,7 @@ def number_in(text: object) -> float | None:
     return float(values[-1]) if values else None
 
 
-def build_markets(kalshi: sqlite3.Connection, pm: sqlite3.Connection,
+def build_markets(kalshi: sqlite3.Connection, pm_sources: list[tuple[str,sqlite3.Connection]],
                   resolver: TeamResolver, kalshi_team_map: dict,
                   source_teams: pd.DataFrame) -> pd.DataFrame:
     out=[]
@@ -120,16 +132,23 @@ def build_markets(kalshi: sqlite3.Connection, pm: sqlite3.Connection,
           "open_time":opened,"close_time":closed,"status":status,"result":result,
           "volume":obj.get("volume_fp"),"liquidity":obj.get("liquidity_dollars"),
           "open_interest":obj.get("open_interest_fp"),"source_team_id":source_team})
-    for row in pm.execute("SELECT id,event_id,condition_id,question,slug,market_type,group_item_title,game_start_time,start_date,end_date,active,closed,volume,liquidity,open_interest,raw_json FROM markets"):
+    for source_league,pm in pm_sources:
+      event_json={str(event_id):json.loads(raw) for event_id,raw in
+                  pm.execute("SELECT id,raw_json FROM events")}
+      for row in pm.execute("SELECT id,event_id,condition_id,question,slug,market_type,group_item_title,game_start_time,start_date,end_date,active,closed,volume,liquidity,open_interest,raw_json FROM markets"):
         mid,eid,condition,question,slug,stype,group,start_game,started,ended,active,closed,volume,liq,oi,raw=row
-        event_raw=pm.execute("SELECT raw_json FROM events WHERE id=?",(eid,)).fetchone()
-        teams=(json.loads(event_raw[0]).get("teams") or []) if event_raw else []
-        league="nfl"
+        teams=event_json.get(str(eid),{}).get("teams") or []
+        league=source_league
         away=home=None
         for team in teams:
-            resolved=resolver.resolve(team.get("name"),league,team.get("abbreviation")).team_id
+            resolved=resolver.resolve(team.get("alias") or team.get("name"),league,team.get("abbreviation")).team_id
             if team.get("ordering")=="away": away=resolved
             elif team.get("ordering")=="home": home=resolved
+        event_title=event_json.get(str(eid),{}).get("title") or ""
+        title_match=re.fullmatch(r"(.+?)\s+vs\.?\s+(.+)",event_title,re.I)
+        if title_match:
+            away=away or resolver.resolve(title_match.group(1),league).team_id
+            home=home or resolver.resolve(title_match.group(2),league).team_id
         obj=json.loads(raw); outcomes=json.loads(obj.get("outcomes") or "[]"); assets=json.loads(obj.get("clobTokenIds") or "[]")
         for index,asset in enumerate(assets):
             label=outcomes[index] if index<len(outcomes) else None
@@ -159,15 +178,21 @@ def build_markets(kalshi: sqlite3.Connection, pm: sqlite3.Connection,
 def write_trade_partitions(source: Path, output: Path, markets: pd.DataFrame) -> None:
     lookup=markets[["venue","league","market_id","event_id","asset_id","market_type",
                     "outcome_team_id","away_team_id","home_team_id"]].copy()
-    for venue,db_name,query,key in (
-      ("kalshi","kalshi_football.sqlite","SELECT trade_id,ticker market_id,NULL asset_id,created_time traded_at,yes_price_dollars price,count_fp size,taker_outcome_side side FROM trades","market_id"),
-      ("polymarket","polymarket_nfl.sqlite","SELECT trade_key trade_id,condition_id,asset_id,datetime(timestamp,'unixepoch') traded_at,price,size,side FROM trades","asset_id")):
+    for venue,league_filter,db_name,query,key in (
+      ("kalshi",None,"kalshi_football.sqlite","SELECT trade_id,ticker market_id,NULL asset_id,created_time traded_at,yes_price_dollars price,count_fp size,taker_outcome_side side FROM trades","market_id"),
+      ("polymarket","nfl","polymarket_nfl.sqlite","SELECT trade_key trade_id,condition_id,asset_id,datetime(timestamp,'unixepoch') traded_at,price,size,side FROM trades","asset_id"),
+      ("polymarket","cfb","polymarket_cfb.sqlite","SELECT trade_key trade_id,condition_id,asset_id,datetime(timestamp,'unixepoch') traded_at,price,size,side FROM trades","asset_id")):
         con=sqlite3.connect(source/db_name)
         venue_lookup=lookup[lookup.venue==venue].drop_duplicates(key)
+        if league_filter: venue_lookup=venue_lookup[venue_lookup.league.eq(league_filter)]
         writers={}
         for chunk in pd.read_sql_query(query,con,chunksize=200_000):
             chunk[key]=chunk[key].astype(str)
             merged=chunk.merge(venue_lookup,on=key,how="left",suffixes=("","_market"))
+            missing=merged["league"].isna()
+            if missing.any():
+                examples=merged.loc[missing,key].drop_duplicates().head(5).tolist()
+                raise ValueError(f"{venue} trades have unknown {key} values: {examples}")
             merged["venue"]=venue
             merged["price"]=pd.to_numeric(merged.price,errors="coerce")
             if venue=="kalshi": merged["price"]=merged.price
@@ -202,18 +227,21 @@ def write_state_partitions(source: Path, curated: Path, markets: pd.DataFrame) -
       volume_24h_fp volume_24h,open_interest_fp open_interest,raw_json FROM market_snapshots""",kalshi)
     ks["venue"]="kalshi"; ks["outcome_prices"]=None; ks["liquidity"]=None
     kalshi.close()
-    pm=sqlite3.connect(source/"polymarket_nfl.sqlite")
-    ps=pd.read_sql_query("""SELECT captured_at,CAST(market_id AS TEXT) market_id,
+    pm_connections=[]; pm_snapshots=[]; pm_books=[]
+    for league,db_name in (("nfl","polymarket_nfl.sqlite"),("cfb","polymarket_cfb.sqlite")):
+      pm=sqlite3.connect(source/db_name); pm_connections.append(pm)
+      ps=pd.read_sql_query("""SELECT captured_at,CAST(market_id AS TEXT) market_id,
       outcome_prices,volume,volume_24h,liquidity,open_interest,best_bid,best_ask,
       last_trade_price last_price,NULL best_bid_size,NULL best_ask_size,NULL status,raw_json
       FROM market_snapshots""",pm)
-    ps["venue"]="polymarket"
-    snapshots=pd.concat([ks,ps],ignore_index=True,sort=False).merge(base,on=["venue","market_id"],how="left")
+      ps["venue"]="polymarket"; pm_snapshots.append(ps)
+      book=pd.read_sql_query("SELECT * FROM order_books",pm); book["_league"]=league; pm_books.append(book)
+    snapshots=pd.concat([ks,*pm_snapshots],ignore_index=True,sort=False).merge(base,on=["venue","market_id"],how="left")
     for column in ("best_bid","best_ask","best_bid_size","best_ask_size","last_price",
                    "volume","volume_24h","liquidity","open_interest"):
         snapshots[column]=pd.to_numeric(snapshots[column],errors="coerce")
     write_frame_partitions(snapshots,curated/"market_snapshots")
-    books=pd.read_sql_query("SELECT * FROM order_books",pm)
+    books=pd.concat(pm_books,ignore_index=True)
     for column in ("best_bid","best_ask","bid_depth","ask_depth","min_order_size",
                    "tick_size","last_trade_price"):
         books[column]=pd.to_numeric(books[column],errors="coerce")
@@ -221,9 +249,62 @@ def write_state_partitions(source: Path, curated: Path, markets: pd.DataFrame) -
       ["asset_id","league","season","market_id","event_id","market_type",
        "away_team_id","home_team_id"]]
     books.asset_id=books.asset_id.astype(str); token_map.asset_id=token_map.asset_id.astype(str)
-    books=books.merge(token_map,on="asset_id",how="left"); books["venue"]="polymarket"
+    books=books.merge(token_map,on=["asset_id"],how="left"); books["venue"]="polymarket"
+    books=books.drop(columns="_league")
     write_frame_partitions(books,curated/"order_books")
-    pm.close()
+    for pm in pm_connections: pm.close()
+
+
+def parquet_row_count(path: Path) -> int:
+    """Return the row count without loading the Parquet data."""
+    return pq.ParquetFile(path).metadata.num_rows
+
+
+def write_manifests(source: Path, output: Path) -> None:
+    """Write build and source inventories for reproducibility checks."""
+    curated=output/"curated"
+    generated_at=datetime.now(timezone.utc).isoformat()
+    dataset_rows=[]
+    flat=("teams","team_aliases","source_teams","markets")
+    for name in flat:
+        path=curated/f"{name}.parquet"
+        dataset_rows.append({
+          "schema_version":SCHEMA_VERSION,"generated_at":generated_at,
+          "dataset":name,"venue":None,"league":None,"season":None,
+          "relative_path":str(path.relative_to(output)),"row_count":parquet_row_count(path),
+          "size_bytes":path.stat().st_size,
+        })
+    for name in ("trades","market_snapshots","order_books"):
+        for path in sorted((curated/name).glob("**/*.parquet")):
+            parts={part.split("=",1)[0]:part.split("=",1)[1]
+                   for part in path.parts if "=" in part}
+            dataset_rows.append({
+              "schema_version":SCHEMA_VERSION,"generated_at":generated_at,
+              "dataset":name,"venue":parts.get("venue"),"league":parts.get("league"),
+              "season":int(parts["season"]) if parts.get("season") else None,
+              "relative_path":str(path.relative_to(output)),
+              "row_count":parquet_row_count(path),"size_bytes":path.stat().st_size,
+            })
+    pd.DataFrame(dataset_rows).to_parquet(
+      curated/"dataset_manifest.parquet",index=False,compression="zstd")
+
+    source_rows=[]
+    for path in sorted(source.glob("*.sqlite")):
+        con=sqlite3.connect(f"file:{path}?mode=ro",uri=True)
+        tables=[row[0] for row in con.execute(
+          "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+        for table in tables:
+            quoted=table.replace('"','""')
+            count=con.execute(f'SELECT count(*) FROM "{quoted}"').fetchone()[0]
+            source_rows.append({
+              "schema_version":SCHEMA_VERSION,"generated_at":generated_at,
+              "source_file":path.name,"source_table":table,"row_count":count,
+              "file_size_bytes":path.stat().st_size,
+              "modified_at":datetime.fromtimestamp(path.stat().st_mtime,timezone.utc).isoformat(),
+            })
+        con.close()
+    pd.DataFrame(source_rows).to_parquet(
+      curated/"source_manifest.parquet",index=False,compression="zstd")
 
 
 def build(source: Path, output: Path, refresh_teams: bool) -> None:
@@ -238,9 +319,10 @@ def build(source: Path, output: Path, refresh_teams: bool) -> None:
     teams=pd.concat(team_frames,ignore_index=True); aliases=pd.concat(alias_frames,ignore_index=True)
     resolver=TeamResolver(teams,aliases)
     kalshi=sqlite3.connect(source/"kalshi_football.sqlite")
-    pm=sqlite3.connect(source/"polymarket_nfl.sqlite")
-    source_teams,kalshi_map,_=source_team_tables(kalshi,pm,resolver)
-    fallback=source_teams[source_teams.team_id.str.startswith("kalshi:",na=False)].drop_duplicates("team_id")
+    pm_sources=[("nfl",sqlite3.connect(source/"polymarket_nfl.sqlite")),
+                ("cfb",sqlite3.connect(source/"polymarket_cfb.sqlite"))]
+    source_teams,kalshi_map,_=source_team_tables(kalshi,pm_sources,resolver)
+    fallback=source_teams[source_teams.team_id.str.match(r"^(kalshi|polymarket):",na=False)].drop_duplicates("team_id")
     if not fallback.empty:
         extra_teams=pd.DataFrame({
           "team_id":fallback.team_id,"espn_team_id":None,"league":fallback.league,
@@ -249,14 +331,36 @@ def build(source: Path, output: Path, refresh_teams: bool) -> None:
           "slug":fallback.source_name.map(normalize_name).str.replace(" ","-"),"logo_url":None})
         extra_aliases=pd.concat([
           pd.DataFrame({"league":fallback.league,"team_id":fallback.team_id,"alias":fallback.source_name,
-            "normalized_alias":fallback.source_name.map(normalize_name),"alias_type":"kalshi_source_name"}),
+            "normalized_alias":fallback.source_name.map(normalize_name),"alias_type":"source_name"}),
           pd.DataFrame({"league":fallback.league,"team_id":fallback.team_id,"alias":fallback.source_abbreviation,
-            "normalized_alias":fallback.source_abbreviation.map(normalize_name),"alias_type":"kalshi_abbreviation"})
+            "normalized_alias":fallback.source_abbreviation.map(normalize_name),"alias_type":"source_abbreviation"})
         ],ignore_index=True)
         teams=pd.concat([teams,extra_teams],ignore_index=True)
         aliases=pd.concat([aliases,extra_aliases],ignore_index=True).drop_duplicates()
-        resolver=TeamResolver(teams,aliases)
-    markets=build_markets(kalshi,pm,resolver,kalshi_map,source_teams)
+    source_aliases=pd.concat([
+      pd.DataFrame({"league":source_teams.league,"team_id":source_teams.team_id,
+        "alias":source_teams.source_name,"normalized_alias":source_teams.source_name.map(normalize_name),
+        "alias_type":source_teams.venue+"_source_name"}),
+      pd.DataFrame({"league":source_teams.league,"team_id":source_teams.team_id,
+        "alias":source_teams.source_abbreviation,
+        "normalized_alias":source_teams.source_abbreviation.map(normalize_name),
+        "alias_type":source_teams.venue+"_source_abbreviation"})
+    ],ignore_index=True)
+    aliases=pd.concat([aliases,source_aliases],ignore_index=True).drop_duplicates()
+    resolver=TeamResolver(teams,aliases)
+    markets=build_markets(kalshi,pm_sources,resolver,kalshi_map,source_teams)
+    game=markets[markets.market_type.isin(["moneyline","spread","total"])]
+    unresolved=game[game.away_team_id.isna() | game.home_team_id.isna()]
+    duplicate_sides=game[game.away_team_id.eq(game.home_team_id)]
+    source_unresolved=source_teams[source_teams.team_id.isna()]
+    audit=output/"audit"; audit.mkdir(parents=True,exist_ok=True)
+    unresolved.to_csv(audit/"unresolved_game_markets.csv",index=False)
+    duplicate_sides.to_csv(audit/"duplicate_side_game_markets.csv",index=False)
+    source_unresolved.to_csv(audit/"unresolved_source_teams.csv",index=False)
+    if len(unresolved) or len(duplicate_sides) or len(source_unresolved):
+        raise ValueError(
+          f"Team validation failed: unresolved games={len(unresolved)}, "
+          f"same-team games={len(duplicate_sides)}, unresolved source teams={len(source_unresolved)}")
     curated=output/"curated"; curated.mkdir(parents=True,exist_ok=True)
     teams.to_parquet(curated/"teams.parquet",index=False)
     aliases.to_parquet(curated/"team_aliases.parquet",index=False)
@@ -266,13 +370,9 @@ def build(source: Path, output: Path, refresh_teams: bool) -> None:
     if trades_dir.exists(): shutil.rmtree(trades_dir)
     write_trade_partitions(source,trades_dir,markets)
     write_state_partitions(source,curated,markets)
-    kalshi.close(); pm.close()
-    game=markets[markets.market_type.isin(["moneyline","spread","total"])]
-    unresolved=game[game.away_team_id.isna() | game.home_team_id.isna()]
-    source_unresolved=source_teams[source_teams.team_id.isna()]
-    audit=output/"audit"; audit.mkdir(parents=True,exist_ok=True)
-    unresolved.to_csv(audit/"unresolved_game_markets.csv",index=False)
-    source_unresolved.to_csv(audit/"unresolved_source_teams.csv",index=False)
+    write_manifests(source,output)
+    kalshi.close()
+    for _,pm in pm_sources: pm.close()
     print(f"teams={len(teams):,} aliases={len(aliases):,} source_teams={len(source_teams):,}")
     print(f"markets={len(markets):,} unresolved_game_markets={len(unresolved):,}")
 

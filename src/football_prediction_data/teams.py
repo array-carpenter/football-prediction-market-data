@@ -131,6 +131,8 @@ class TeamResolver:
     def resolve(self, value: object, league: str, abbreviation: object = None) -> Match:
         index = self.lookup.get(league, {})
         manual = self.manual_lookup.get(league, {})
+        if normalize_name(value) in {"yes","no","over","under","draw","tie"}:
+            return Match(None,"not_a_team",None)
         for candidate, method in ((value, "name_exact"), (abbreviation, "abbreviation_exact")):
             key = normalize_name(candidate)
             if key in manual:

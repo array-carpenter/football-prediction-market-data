@@ -4,13 +4,12 @@ This repository builds a clean football prediction-market dataset from the
 local Kalshi and Polymarket collectors.
 
 The curated data uses the same team identifier for both venues. ESPN team IDs
-are the primary identifiers. A stable Kalshi UUID identifier is used only when
-ESPN does not list a team.
+are the primary identifiers. A stable venue identifier is used only when ESPN
+does not list a team.
 
 ## Current data
 
-The build includes college football and NFL Kalshi data. It also includes NFL
-Polymarket data.
+The build includes college football and NFL data from Kalshi and Polymarket.
 
 The primary files are:
 
@@ -21,9 +20,14 @@ The primary files are:
 - `data/curated/trades/**/*.parquet`
 - `data/curated/market_snapshots/**/*.parquet`
 - `data/curated/order_books/**/*.parquet`
+- `data/curated/dataset_manifest.parquet`
+- `data/curated/source_manifest.parquet`
 
 The directory datasets use Hive partitions. The partition fields are `venue`,
 `league`, and `season`.
+
+`dataset_manifest.parquet` gives the row count and file size for each output.
+`source_manifest.parquet` gives the source table row counts for each build.
 
 ## Build
 
@@ -41,6 +45,27 @@ The default source directory is:
 ```
 
 Use `--source` to select a different source directory.
+
+The local scheduler runs this build each hour. The source collectors run every
+five minutes. These jobs run only while the computer is awake.
+
+## Run the collectors
+
+Run one current capture for each source:
+
+```sh
+cd ../nfl-prediction-market
+.venv/bin/python -m src.capture_kalshi_football capture
+.venv/bin/python -m src.capture_polymarket_nfl capture
+.venv/bin/python -m src.capture_polymarket_nfl --sport cfb capture
+```
+
+Return to this repository. Then rebuild the Parquet files:
+
+```sh
+cd ../football-prediction-market-data
+.venv/bin/python -m football_prediction_data.build
+```
 
 ## Load all trades
 
