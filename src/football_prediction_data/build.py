@@ -33,6 +33,7 @@ def download(url: str, path: Path) -> None:
 
 
 def source_team_tables(kalshi: sqlite3.Connection, pm_sources: list[tuple[str,sqlite3.Connection]],
+                       novig: sqlite3.Connection,
                        resolver: TeamResolver) -> tuple[pd.DataFrame, dict, dict]:
     rows = []
     kalshi_map = {}
@@ -78,6 +79,19 @@ def source_team_tables(kalshi: sqlite3.Connection, pm_sources: list[tuple[str,sq
             rows.append({"venue":"polymarket","league":league,"source_team_id":source_id,
                          "source_name":source_name,"source_abbreviation":team.get("abbreviation"),
                          "team_id":match.team_id,"match_method":match.method,"match_score":match.score})
+    for league,away,home in novig.execute(
+      "SELECT DISTINCT league,away_team,home_team FROM events"):
+        for source_name in (away,home):
+            if not source_name:
+                continue
+            match=resolver.resolve(source_name,league)
+            source_id=normalize_name(source_name)
+            if not match.team_id:
+                match=type(match)(f"novig:{league}:{source_id}","novig_name_fallback",None)
+            rows.append({"venue":"novig","league":league,"source_team_id":source_id,
+                         "source_name":source_name,"source_abbreviation":None,
+                         "team_id":match.team_id,"match_method":match.method,
+                         "match_score":match.score})
     return pd.DataFrame(rows).drop_duplicates(),kalshi_map,pm_map
 
 
@@ -107,6 +121,7 @@ def number_in(text: object) -> float | None:
 
 
 def build_markets(kalshi: sqlite3.Connection, pm_sources: list[tuple[str,sqlite3.Connection]],
+                  novig: sqlite3.Connection,
                   resolver: TeamResolver, kalshi_team_map: dict,
                   source_teams: pd.DataFrame) -> pd.DataFrame:
     out=[]
@@ -159,6 +174,25 @@ def build_markets(kalshi: sqlite3.Connection, pm_sources: list[tuple[str,sqlite3
               "away_team_id":away,"home_team_id":home,"line":number_in(group),
               "open_time":started,"close_time":ended,"status":"closed" if closed else "open",
               "result":None,"volume":volume,"liquidity":liq,"open_interest":oi,"source_team_id":None})
+    latest_novig={row[0]:row[1] for row in novig.execute("""SELECT market_id,line FROM (
+      SELECT market_id,line,row_number() OVER (PARTITION BY market_id ORDER BY captured_at DESC) rank
+      FROM market_snapshots) WHERE rank=1""")}
+    novig_events={(row[0],row[1]):row[2:] for row in novig.execute(
+      "SELECT event_id,league,commence_time,away_team,home_team,first_seen_at FROM events")}
+    type_map={"h2h":"moneyline","spreads":"spread","totals":"total"}
+    for mid,eid,league,stype,outcome,first_seen,last_seen in novig.execute(
+      "SELECT market_id,event_id,league,market_type,outcome_name,first_seen_at,last_seen_at FROM markets"):
+        commence,away_name,home_name,event_first=novig_events[(eid,league)]
+        away=resolver.resolve(away_name,league).team_id
+        home=resolver.resolve(home_name,league).team_id
+        out.append({"venue":"novig","league":league,"season":2026,"market_id":mid,
+          "event_id":eid,"asset_id":None,"market_type":type_map.get(stype,"other"),
+          "question":f"{away_name} vs. {home_name} {stype}","outcome_label":outcome,
+          "outcome_team_id":resolver.resolve(outcome,league).team_id,
+          "away_team_id":away,"home_team_id":home,"line":latest_novig.get(mid),
+          "open_time":event_first or first_seen,"close_time":commence,"status":"open",
+          "result":None,"volume":None,"liquidity":None,"open_interest":None,
+          "source_team_id":normalize_name(outcome) if outcome not in ("Over","Under") else None})
     frame=pd.DataFrame(out)
     frame["_event_key"]=frame.event_id.astype(str).str.split("-",n=1).str[-1]
     for column in ("away_team_id","home_team_id"):
@@ -199,21 +233,29 @@ def write_trade_partitions(source: Path, output: Path, markets: pd.DataFrame) ->
             merged["size"]=pd.to_numeric(merged["size"],errors="coerce")
             for league,part in merged.groupby("league",dropna=False):
                 if pd.isna(league): continue
-                path=output/f"venue={venue}"/f"league={league}"/"season=2026"/"part-000.parquet"
+                path=output/f"league={league}"/f"venue={venue}"/"season=2026"/"part-000.parquet"
                 path.parent.mkdir(parents=True,exist_ok=True)
-                table=pa.Table.from_pandas(part, preserve_index=False)
+                stored=part.drop(columns=["venue","league","season"],errors="ignore")
+                table=pa.Table.from_pandas(stored,preserve_index=False)
                 if league not in writers: writers[league]=pq.ParquetWriter(path,table.schema,compression="zstd")
                 writers[league].write_table(table)
         for writer in writers.values(): writer.close()
         con.close()
 
 
-def write_frame_partitions(frame: pd.DataFrame, root: Path) -> None:
+def write_frame_partitions(frame: pd.DataFrame, root: Path,
+                           partition_columns: tuple[str,...]=("league","venue","season")) -> None:
     if root.exists(): shutil.rmtree(root)
-    for (venue,league),part in frame.groupby(["venue","league"]):
-        path=root/f"venue={venue}"/f"league={league}"/"season=2026"/"part-000.parquet"
+    for keys,part in frame.groupby(list(partition_columns)):
+        if not isinstance(keys,tuple): keys=(keys,)
+        path=root
+        for column,value in zip(partition_columns,keys):
+            rendered=str(int(value)) if column=="season" else str(value)
+            path=path/f"{column}={rendered}"
+        path=path/"part-000.parquet"
         path.parent.mkdir(parents=True,exist_ok=True)
-        part.to_parquet(path,index=False,compression="zstd")
+        stored=part.drop(columns=list(partition_columns),errors="ignore")
+        stored.to_parquet(path,index=False,compression="zstd")
 
 
 def write_state_partitions(source: Path, curated: Path, markets: pd.DataFrame) -> None:
@@ -236,7 +278,14 @@ def write_state_partitions(source: Path, curated: Path, markets: pd.DataFrame) -
       FROM market_snapshots""",pm)
       ps["venue"]="polymarket"; pm_snapshots.append(ps)
       book=pd.read_sql_query("SELECT * FROM order_books",pm); book["_league"]=league; pm_books.append(book)
-    snapshots=pd.concat([ks,*pm_snapshots],ignore_index=True,sort=False).merge(base,on=["venue","market_id"],how="left")
+    novig=sqlite3.connect(source/"novig_football.sqlite")
+    ns=pd.read_sql_query("""SELECT captured_at,market_id,NULL status,NULL best_bid,NULL best_ask,
+      NULL best_bid_size,NULL best_ask_size,implied_probability last_price,NULL volume,
+      NULL volume_24h,NULL liquidity,NULL open_interest,NULL outcome_prices,
+      decimal_odds,line,raw_json FROM market_snapshots""",novig)
+    ns["venue"]="novig"; novig.close()
+    snapshots=pd.concat([ks,*pm_snapshots,ns],ignore_index=True,sort=False).merge(
+      base,on=["venue","market_id"],how="left")
     for column in ("best_bid","best_ask","best_bid_size","best_ask_size","last_price",
                    "volume","volume_24h","liquidity","open_interest"):
         snapshots[column]=pd.to_numeric(snapshots[column],errors="coerce")
@@ -265,23 +314,15 @@ def write_manifests(source: Path, output: Path) -> None:
     curated=output/"curated"
     generated_at=datetime.now(timezone.utc).isoformat()
     dataset_rows=[]
-    flat=("teams","team_aliases","source_teams","markets")
-    for name in flat:
-        path=curated/f"{name}.parquet"
-        dataset_rows.append({
-          "schema_version":SCHEMA_VERSION,"generated_at":generated_at,
-          "dataset":name,"venue":None,"league":None,"season":None,
-          "relative_path":str(path.relative_to(output)),"row_count":parquet_row_count(path),
-          "size_bytes":path.stat().st_size,
-        })
-    for name in ("trades","market_snapshots","order_books"):
+    for name in ("teams","team_aliases","source_teams","markets","trades",
+                 "market_snapshots","order_books"):
         for path in sorted((curated/name).glob("**/*.parquet")):
             parts={part.split("=",1)[0]:part.split("=",1)[1]
                    for part in path.parts if "=" in part}
             dataset_rows.append({
               "schema_version":SCHEMA_VERSION,"generated_at":generated_at,
               "dataset":name,"venue":parts.get("venue"),"league":parts.get("league"),
-              "season":int(parts["season"]) if parts.get("season") else None,
+              "season":int(float(parts["season"])) if parts.get("season") else None,
               "relative_path":str(path.relative_to(output)),
               "row_count":parquet_row_count(path),"size_bytes":path.stat().st_size,
             })
@@ -321,8 +362,10 @@ def build(source: Path, output: Path, refresh_teams: bool) -> None:
     kalshi=sqlite3.connect(source/"kalshi_football.sqlite")
     pm_sources=[("nfl",sqlite3.connect(source/"polymarket_nfl.sqlite")),
                 ("cfb",sqlite3.connect(source/"polymarket_cfb.sqlite"))]
-    source_teams,kalshi_map,_=source_team_tables(kalshi,pm_sources,resolver)
-    fallback=source_teams[source_teams.team_id.str.match(r"^(kalshi|polymarket):",na=False)].drop_duplicates("team_id")
+    novig=sqlite3.connect(source/"novig_football.sqlite")
+    source_teams,kalshi_map,_=source_team_tables(kalshi,pm_sources,novig,resolver)
+    fallback=source_teams[source_teams.team_id.str.match(
+      r"^(kalshi|polymarket|novig):",na=False)].drop_duplicates("team_id")
     if not fallback.empty:
         extra_teams=pd.DataFrame({
           "team_id":fallback.team_id,"espn_team_id":None,"league":fallback.league,
@@ -348,7 +391,7 @@ def build(source: Path, output: Path, refresh_teams: bool) -> None:
     ],ignore_index=True)
     aliases=pd.concat([aliases,source_aliases],ignore_index=True).drop_duplicates()
     resolver=TeamResolver(teams,aliases)
-    markets=build_markets(kalshi,pm_sources,resolver,kalshi_map,source_teams)
+    markets=build_markets(kalshi,pm_sources,novig,resolver,kalshi_map,source_teams)
     game=markets[markets.market_type.isin(["moneyline","spread","total"])]
     unresolved=game[game.away_team_id.isna() | game.home_team_id.isna()]
     duplicate_sides=game[game.away_team_id.eq(game.home_team_id)]
@@ -362,10 +405,13 @@ def build(source: Path, output: Path, refresh_teams: bool) -> None:
           f"Team validation failed: unresolved games={len(unresolved)}, "
           f"same-team games={len(duplicate_sides)}, unresolved source teams={len(source_unresolved)}")
     curated=output/"curated"; curated.mkdir(parents=True,exist_ok=True)
-    teams.to_parquet(curated/"teams.parquet",index=False)
-    aliases.to_parquet(curated/"team_aliases.parquet",index=False)
-    source_teams.to_parquet(curated/"source_teams.parquet",index=False)
-    markets.to_parquet(curated/"markets.parquet",index=False)
+    for old_name in ("teams.parquet","team_aliases.parquet","source_teams.parquet",
+                     "markets.parquet"):
+        (curated/old_name).unlink(missing_ok=True)
+    write_frame_partitions(teams,curated/"teams",("league",))
+    write_frame_partitions(aliases,curated/"team_aliases",("league",))
+    write_frame_partitions(source_teams,curated/"source_teams",("league",))
+    write_frame_partitions(markets,curated/"markets",("league","season"))
     trades_dir=curated/"trades"
     if trades_dir.exists(): shutil.rmtree(trades_dir)
     write_trade_partitions(source,trades_dir,markets)
@@ -373,6 +419,7 @@ def build(source: Path, output: Path, refresh_teams: bool) -> None:
     write_manifests(source,output)
     kalshi.close()
     for _,pm in pm_sources: pm.close()
+    novig.close()
     print(f"teams={len(teams):,} aliases={len(aliases):,} source_teams={len(source_teams):,}")
     print(f"markets={len(markets):,} unresolved_game_markets={len(unresolved):,}")
 

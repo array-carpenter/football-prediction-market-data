@@ -1,14 +1,14 @@
 CREATE OR REPLACE VIEW teams AS
-SELECT * FROM read_parquet('data/curated/teams.parquet');
+SELECT * FROM read_parquet('data/curated/teams/**/*.parquet', hive_partitioning = true);
 
 CREATE OR REPLACE VIEW team_aliases AS
-SELECT * FROM read_parquet('data/curated/team_aliases.parquet');
+SELECT * FROM read_parquet('data/curated/team_aliases/**/*.parquet', hive_partitioning = true);
 
 CREATE OR REPLACE VIEW source_teams AS
-SELECT * FROM read_parquet('data/curated/source_teams.parquet');
+SELECT * FROM read_parquet('data/curated/source_teams/**/*.parquet', hive_partitioning = true);
 
 CREATE OR REPLACE VIEW markets AS
-SELECT * FROM read_parquet('data/curated/markets.parquet');
+SELECT * FROM read_parquet('data/curated/markets/**/*.parquet', hive_partitioning = true);
 
 CREATE OR REPLACE VIEW dataset_manifest AS
 SELECT * FROM read_parquet('data/curated/dataset_manifest.parquet');

@@ -18,6 +18,19 @@ The public trade API has a deep-pagination limit. Some older, high-volume event
 tails require an on-chain event-log backfill. The live collector prevents new
 gaps while it runs.
 
+## Novig
+
+The source database is `novig_football.sqlite`. The collector gets current
+Novig moneyline, spread, and total prices from The Odds API.
+
+Novig does not publish a documented public market-data API. The available feed
+does not include trades, volume, or order books. It also does not provide a
+historical backfill on the current account. The collector stores changed price
+and line snapshots from the time collection starts.
+
+The current account has 500 request credits each month. One full CFB and NFL
+capture uses six credits. The scheduler runs two captures each day.
+
 ## ESPN
 
 The build downloads the ESPN college football and NFL team directories. ESPN

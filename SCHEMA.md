@@ -21,11 +21,12 @@ Teams absent from ESPN use this format:
 ```text
 kalshi:{league}:{kalshi_team_uuid}
 polymarket:{league}:{polymarket_team_id}
+novig:{league}:{normalized_team_name}
 ```
 
 Source identifiers remain available. Do not replace them with display names.
 
-## `teams.parquet`
+## `teams/`
 
 One row exists for each canonical team.
 
@@ -42,21 +43,21 @@ One row exists for each canonical team.
 | `slug` | URL-safe team name. |
 | `logo_url` | ESPN logo URL when available. |
 
-## `team_aliases.parquet`
+## `team_aliases/`
 
 This table documents every accepted source name.
 
 `normalized_alias` is used for matching. `alias_type` records the source of the
 alias. Manual aliases take precedence over ambiguous ESPN aliases.
 
-## `source_teams.parquet`
+## `source_teams/`
 
 This table maps venue identifiers and names to `team_id`.
 
 The key is `(venue, league, source_team_id)`. The table preserves the original
 name and abbreviation. It also records the match method and score.
 
-## `markets.parquet`
+## `markets/`
 
 One row exists for each tradeable outcome token or Kalshi market contract in a
 source league. A Polymarket contract with both league tags has one row for each
@@ -66,7 +67,7 @@ Important columns are:
 
 | Column | Meaning |
 | --- | --- |
-| `venue` | `kalshi` or `polymarket`. |
+| `venue` | `kalshi`, `polymarket`, or `novig`. |
 | `league` | `cfb` or `nfl`. |
 | `season` | Football season year. |
 | `market_id` | Venue market identifier. |
@@ -97,6 +98,10 @@ outcome tokens.
 
 Rows record changed or scheduled market state. Common fields include best bid,
 best ask, last price, volume, 24-hour volume, liquidity, and open interest.
+
+For Novig, `decimal_odds` is the quoted decimal price. `last_price` is the
+inverse decimal price. It is an implied probability. It is not a trade price.
+The `line` field records the spread or total for that snapshot.
 
 ## `order_books/`
 

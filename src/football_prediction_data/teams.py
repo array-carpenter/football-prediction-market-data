@@ -17,6 +17,7 @@ MANUAL_ALIASES = {
         "appalachian state": "2026",
         "appalachian st": "2026",
         "app st": "2026",
+        "appalachian state mountaineers": "2026",
         "uga": "61",
         "georgia": "61",
         "ga southern": "290",
@@ -49,6 +50,9 @@ MANUAL_ALIASES = {
         "nc state": "152",
         "charlotte": "2429",
         "troy": "2653",
+        "grambling state tigers": "2755",
+        "sam houston state bearkats": "2534",
+        "southern mississippi golden eagles": "2572",
     },
     "nfl": {
         "ny giants": "19",
