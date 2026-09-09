@@ -64,6 +64,9 @@ MANUAL_ALIASES = {
         "la chargers": "24",
         "los angeles c": "24",
         "jac jaguars": "30",
+        "jac": "30",
+        "la": "14",
+        "was": "28",
     },
 }
 

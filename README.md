@@ -13,6 +13,10 @@ The build includes college football and NFL data from Kalshi, Polymarket, and
 Novig. Novig supplies price snapshots. It does not supply public trades or
 volume.
 
+The build also includes a historical Kalshi NFL slice from the Becker archive.
+This slice has 9,427,707 trades from July 16, 2025 through January 18, 2026.
+It gives the dataset a previous season of NFL market movement.
+
 The primary files are:
 
 - `data/curated/teams/league=*/part-000.parquet`
@@ -38,6 +42,7 @@ data/curated/market_snapshots/league=cfb/
 
 `dataset_manifest.parquet` gives the row count and file size for each output.
 `source_manifest.parquet` gives the source table row counts for each build.
+Use `data_source` to separate live API records from archive records.
 
 ## Build
 
@@ -104,6 +109,18 @@ SELECT venue, league, count(*) AS trades, sum(size) AS contracts
 FROM trades
 GROUP BY ALL
 ORDER BY venue, league;
+```
+
+Load only the Becker NFL trade slice:
+
+```sql
+SELECT *
+FROM read_parquet(
+  'data/curated/trades/league=nfl/venue=kalshi/season=2025/*.parquet',
+  hive_partitioning = true,
+  union_by_name = true
+)
+WHERE data_source = 'becker_archive';
 ```
 
 ### Python

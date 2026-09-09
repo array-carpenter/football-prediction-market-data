@@ -73,6 +73,8 @@ Important columns are:
 | `market_id` | Venue market identifier. |
 | `event_id` | Venue event identifier. |
 | `asset_id` | Polymarket outcome-token ID. Null for Kalshi. |
+| `series_ticker` | Original Kalshi series. Null for other venues. |
+| `source_market_type` | Original venue market type or series. |
 | `market_type` | `moneyline`, `spread`, `total`, or `other`. |
 | `outcome_label` | Original venue outcome label. |
 | `outcome_team_id` | Canonical team represented by the outcome. |
@@ -82,6 +84,8 @@ Important columns are:
 | `volume` | Venue-reported cumulative volume. |
 | `liquidity` | Venue-reported liquidity. |
 | `open_interest` | Venue-reported open interest. |
+| `data_source` | API or archive source for the row. |
+| `metadata_quality` | `source` or `synthetic_from_ticker`. |
 
 ## `trades/`
 
@@ -94,10 +98,20 @@ the canonical team identifiers.
 Prices use decimal dollars from 0 through 1. Size is the number of contracts or
 outcome tokens.
 
+`data_source` identifies the source. Current values are `kalshi_api`,
+`polymarket_api`, and `becker_archive`.
+
+Becker trade IDs are stable synthetic IDs. The builder hashes the ticker,
+contract count, prices, taker side, and trade time. The source file does not
+include a trade ID.
+
 ## `market_snapshots/`
 
 Rows record changed or scheduled market state. Common fields include best bid,
 best ask, last price, volume, 24-hour volume, liquidity, and open interest.
+
+Historical Becker snapshots convert cent prices to decimal prices. They use
+`data_source = 'becker_archive'`.
 
 For Novig, `decimal_odds` is the quoted decimal price. `last_price` is the
 inverse decimal price. It is an implied probability. It is not a trade price.
@@ -122,5 +136,6 @@ Every `moneyline`, `spread`, and `total` game market must have both
 `dataset_manifest.parquet` records each output file, partition, row count, file
 size, schema version, and build time.
 
-`source_manifest.parquet` records each SQLite source table, row count, source
-file size, modification time, schema version, and build time.
+`source_manifest.parquet` records each SQLite source table and each Parquet
+source file. It includes the row count, file size, modification time, schema
+version, and build time.

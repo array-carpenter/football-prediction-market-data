@@ -54,17 +54,33 @@ def test_market_contract_ids_are_unique():
 
 def test_trades_reference_known_contracts():
     count=duckdb.sql(f"""WITH t AS (
-      SELECT venue,league,market_id,asset_id
+      SELECT venue,league,coalesce(asset_id,market_id) contract_id
       FROM read_parquet('{DATA}/trades/**/*.parquet',hive_partitioning=true,union_by_name=true)
     ), m AS (
-      SELECT venue,league,market_id,asset_id
+      SELECT venue,league,coalesce(asset_id,market_id) contract_id
       FROM read_parquet('{MARKETS}',hive_partitioning=true)
     )
     SELECT count(*) FROM t LEFT JOIN m
       ON t.venue=m.venue AND t.league=m.league
-      AND CASE WHEN t.venue='kalshi' THEN t.market_id=m.market_id ELSE t.asset_id=m.asset_id END
-    WHERE m.market_id IS NULL""").fetchone()[0]
+      AND t.contract_id=m.contract_id
+    WHERE m.contract_id IS NULL""").fetchone()[0]
     assert count==0
+
+
+def test_becker_nfl_archive_is_complete_and_standardized():
+    row=duckdb.sql(f"""SELECT count(*),min(price),max(price),min(traded_at),max(traded_at)
+      FROM read_parquet('{DATA}/trades/league=nfl/venue=kalshi/season=2025/part-becker.parquet')
+      WHERE data_source='becker_archive'""").fetchone()
+    assert row[0]==9_427_707
+    assert 0<=row[1]<=row[2]<=1
+    assert str(row[3]).startswith("2025-07-16")
+    assert str(row[4]).startswith("2026-01-18")
+
+
+def test_synthetic_becker_markets_are_labeled():
+    count=duckdb.sql(f"""SELECT count(*) FROM read_parquet('{MARKETS}',hive_partitioning=true)
+      WHERE data_source='becker_archive' AND metadata_quality='synthetic_from_ticker'""").fetchone()[0]
+    assert count==176
 
 
 def test_source_team_keys_have_one_canonical_team():

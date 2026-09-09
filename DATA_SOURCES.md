@@ -8,6 +8,31 @@ trades, and scheduled market snapshots.
 Historical trades recover Week 0 and Week 1 price paths and traded volume. Old
 order-book states cannot be reconstructed when no collector recorded them.
 
+### Becker historical NFL slice
+
+The source directory contains these staged archive files:
+
+- `kalshi_nfl_markets.parquet`
+- `kalshi_nfl_trades.parquet`
+- `kalshi_nfl_snapshots.parquet`
+
+The market file has 33,129 Kalshi NFL market records. The trade file has
+9,427,707 `KXNFLGAME` trade records. The trade dates start on July 16, 2025.
+They end on January 18, 2026.
+
+The staged trade file has no source trade ID. The builder creates a stable hash
+from all available execution fields. It converts Kalshi cent prices to decimal
+prices.
+
+The market file does not contain 176 tickers that occur in the trade file. The
+builder recovers these market pairs from the event ticker and outcome suffixes.
+It sets `metadata_quality = 'synthetic_from_ticker'` for these rows. It keeps all
+trade rows.
+
+The full published Becker archive is about 36 GB in compressed form. This
+repository uses the staged NFL files. It does not require the full archive for
+each build.
+
 ## Polymarket
 
 The source databases are `polymarket_nfl.sqlite` and
