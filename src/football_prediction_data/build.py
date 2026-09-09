@@ -327,8 +327,8 @@ def write_trade_partitions(source: Path, output: Path, markets: pd.DataFrame) ->
                     "outcome_team_id","away_team_id","home_team_id"]].copy()
     for venue,league_filter,db_name,query,key in (
       ("kalshi",None,"kalshi_football.sqlite","SELECT trade_id,ticker market_id,NULL asset_id,created_time traded_at,yes_price_dollars price,count_fp size,taker_outcome_side side FROM trades","market_id"),
-      ("polymarket","nfl","polymarket_nfl.sqlite","SELECT trade_key trade_id,condition_id,asset_id,datetime(timestamp,'unixepoch') traded_at,price,size,side FROM trades","asset_id"),
-      ("polymarket","cfb","polymarket_cfb.sqlite","SELECT trade_key trade_id,condition_id,asset_id,datetime(timestamp,'unixepoch') traded_at,price,size,side FROM trades","asset_id")):
+      ("polymarket","nfl","polymarket_nfl.sqlite","SELECT trade_key trade_id,condition_id,asset_id,datetime(timestamp,'unixepoch') || 'Z' traded_at,price,size,side FROM trades","asset_id"),
+      ("polymarket","cfb","polymarket_cfb.sqlite","SELECT trade_key trade_id,condition_id,asset_id,datetime(timestamp,'unixepoch') || 'Z' traded_at,price,size,side FROM trades","asset_id")):
         con=sqlite3.connect(source/db_name)
         venue_lookup=lookup[lookup.venue==venue].drop_duplicates(key)
         if league_filter: venue_lookup=venue_lookup[venue_lookup.league.eq(league_filter)]

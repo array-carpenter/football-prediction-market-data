@@ -1,9 +1,6 @@
 .venv/
 __pycache__/
 .pytest_cache/
-data/**/*.parquet
-data/**/*.json
-data/**/*.csv
 data/*.log
 *.duckdb
 .DS_Store

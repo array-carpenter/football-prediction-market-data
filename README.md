@@ -29,6 +29,10 @@ The primary files are:
 - `data/curated/dataset_manifest.parquet`
 - `data/curated/source_manifest.parquet`
 
+The repository stores generated Parquet files with Git LFS. Run `git lfs pull`
+after you clone the repository. This command downloads the complete data
+snapshot.
+
 The directory datasets use Hive partitions. The first partition is `league`.
 Use `league=cfb` or `league=nfl` to load one league.
 
