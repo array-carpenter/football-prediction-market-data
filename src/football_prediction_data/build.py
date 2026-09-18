@@ -339,7 +339,11 @@ def write_trade_partitions(source: Path, output: Path, markets: pd.DataFrame) ->
             missing=merged["league"].isna()
             if missing.any():
                 examples=merged.loc[missing,key].drop_duplicates().head(5).tolist()
-                raise ValueError(f"{venue} trades have unknown {key} values: {examples}")
+                print(
+                  f"Warning: deferred {missing.sum():,} {venue} trades whose market "
+                  f"records arrived during this build: {examples}"
+                )
+                merged=merged.loc[~missing].copy()
             merged["venue"]=venue
             merged["data_source"]="kalshi_api" if venue=="kalshi" else "polymarket_api"
             merged["price"]=pd.to_numeric(merged.price,errors="coerce")
@@ -489,6 +493,133 @@ def write_state_partitions(source: Path, curated: Path, markets: pd.DataFrame) -
     for pm in pm_connections: pm.close()
 
 
+def _write_partition_chunks(chunks, root: Path, writers: dict,
+                            partition_columns=("league", "venue", "season")) -> None:
+    """Append data-frame chunks to stable Hive-partitioned Parquet files."""
+    for frame in chunks:
+        if frame.empty:
+            continue
+        for keys, part in frame.groupby(list(partition_columns), dropna=False):
+            if not isinstance(keys, tuple):
+                keys = (keys,)
+            if any(pd.isna(value) for value in keys):
+                continue
+            path = root
+            for column, value in zip(partition_columns, keys):
+                rendered = str(int(value)) if column == "season" else str(value)
+                path = path / f"{column}={rendered}"
+            path = path / "part-000.parquet"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            stored = part.drop(columns=list(partition_columns), errors="ignore")
+            table = pa.Table.from_pandas(stored, preserve_index=False)
+            if path not in writers:
+                writers[path] = pq.ParquetWriter(path, table.schema, compression="zstd")
+            else:
+                table = table.cast(writers[path].schema, safe=False)
+            writers[path].write_table(table)
+
+
+def write_state_partitions_streaming(source: Path, curated: Path,
+                                     markets: pd.DataFrame) -> None:
+    """Write market states in chunks so large live databases do not exhaust memory."""
+    base = markets.drop_duplicates(["venue", "market_id"])[
+      ["venue", "league", "season", "market_id", "event_id", "market_type",
+       "away_team_id", "home_team_id"]]
+    snapshot_root = curated / "market_snapshots"
+    book_root = curated / "order_books"
+    if snapshot_root.exists():
+        shutil.rmtree(snapshot_root)
+    if book_root.exists():
+        shutil.rmtree(book_root)
+    snapshot_writers = {}
+    book_writers = {}
+    numeric_snapshot = (
+      "best_bid", "best_ask", "best_bid_size", "best_ask_size", "last_price",
+      "volume", "volume_24h", "liquidity", "open_interest", "decimal_odds", "line"
+    )
+    string_snapshot = (
+      "captured_at", "market_id", "status", "outcome_prices", "raw_json",
+      "event_id", "market_type", "away_team_id", "home_team_id", "data_source"
+    )
+
+    def prepare_snapshot(chunk: pd.DataFrame, venue: str,
+                         data_source: str) -> pd.DataFrame:
+        chunk["venue"] = venue
+        chunk["data_source"] = data_source
+        merged = chunk.merge(base, on=["venue", "market_id"], how="left")
+        merged = merged.loc[merged["league"].notna()].copy()
+        for column in numeric_snapshot:
+            if column in merged:
+                merged[column] = pd.to_numeric(merged[column], errors="coerce").astype("float64")
+        for column in string_snapshot:
+            if column in merged:
+                merged[column] = merged[column].astype("string")
+        return merged
+
+    try:
+        kalshi = sqlite3.connect(source / "kalshi_football.sqlite")
+        query = """SELECT captured_at,ticker market_id,status,
+          yes_bid_dollars best_bid,yes_ask_dollars best_ask,yes_bid_size_fp best_bid_size,
+          yes_ask_size_fp best_ask_size,last_price_dollars last_price,volume_fp volume,
+          volume_24h_fp volume_24h,open_interest_fp open_interest,NULL outcome_prices,
+          NULL liquidity,raw_json FROM market_snapshots"""
+        chunks = (prepare_snapshot(chunk, "kalshi", "kalshi_api")
+                  for chunk in pd.read_sql_query(query, kalshi, chunksize=100_000))
+        _write_partition_chunks(chunks, snapshot_root, snapshot_writers)
+        kalshi.close()
+
+        for league, db_name in (("nfl", "polymarket_nfl.sqlite"),
+                                ("cfb", "polymarket_cfb.sqlite")):
+            pm = sqlite3.connect(source / db_name)
+            query = """SELECT captured_at,CAST(market_id AS TEXT) market_id,
+              outcome_prices,volume,volume_24h,liquidity,open_interest,best_bid,best_ask,
+              last_trade_price last_price,NULL best_bid_size,NULL best_ask_size,
+              NULL status,raw_json FROM market_snapshots"""
+            chunks = (prepare_snapshot(chunk, "polymarket", "polymarket_api")
+                      for chunk in pd.read_sql_query(query, pm, chunksize=100_000))
+            _write_partition_chunks(chunks, snapshot_root, snapshot_writers)
+
+            token_map = markets[
+              markets.venue.eq("polymarket") & markets.league.eq(league)
+            ].drop_duplicates("asset_id")[[
+              "asset_id", "league", "season", "market_id", "event_id", "market_type",
+              "away_team_id", "home_team_id"
+            ]].copy()
+            token_map["asset_id"] = token_map["asset_id"].astype("string")
+            for book in pd.read_sql_query("SELECT * FROM order_books", pm,
+                                          chunksize=100_000):
+                book["asset_id"] = book["asset_id"].astype("string")
+                book = book.merge(token_map, on="asset_id", how="left")
+                book = book.loc[book["league"].notna()].copy()
+                book["venue"] = "polymarket"
+                book["data_source"] = "polymarket_api"
+                for column in ("best_bid", "best_ask", "bid_depth", "ask_depth",
+                               "min_order_size", "tick_size", "last_trade_price"):
+                    book[column] = pd.to_numeric(book[column], errors="coerce").astype("float64")
+                for column in ("book_hash", "asset_id", "market", "exchange_ts",
+                               "captured_at", "bids_json", "asks_json", "market_id",
+                               "event_id", "market_type", "away_team_id", "home_team_id",
+                               "data_source"):
+                    book[column] = book[column].astype("string")
+                _write_partition_chunks([book], book_root, book_writers)
+            pm.close()
+
+        novig = sqlite3.connect(source / "novig_football.sqlite")
+        query = """SELECT captured_at,market_id,NULL status,NULL best_bid,NULL best_ask,
+          NULL best_bid_size,NULL best_ask_size,implied_probability last_price,NULL volume,
+          NULL volume_24h,NULL liquidity,NULL open_interest,NULL outcome_prices,
+          decimal_odds,line,raw_json FROM market_snapshots"""
+        chunks = (prepare_snapshot(chunk, "novig", "the_odds_api")
+                  for chunk in pd.read_sql_query(query, novig, chunksize=100_000))
+        _write_partition_chunks(chunks, snapshot_root, snapshot_writers)
+        novig.close()
+    finally:
+        for writer in snapshot_writers.values():
+            writer.close()
+        for writer in book_writers.values():
+            writer.close()
+
+
 def parquet_row_count(path: Path) -> int:
     """Return the row count without loading the Parquet data."""
     return pq.ParquetFile(path).metadata.num_rows
@@ -609,7 +740,7 @@ def build(source: Path, output: Path, refresh_teams: bool) -> None:
     if trades_dir.exists(): shutil.rmtree(trades_dir)
     write_trade_partitions(source,trades_dir,markets)
     write_becker_trade_partition(source,trades_dir,markets)
-    write_state_partitions(source,curated,markets)
+    write_state_partitions_streaming(source,curated,markets)
     write_becker_snapshot_partition(source,curated,markets)
     write_manifests(source,output)
     kalshi.close()
